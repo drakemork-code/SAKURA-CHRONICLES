@@ -20,7 +20,7 @@ app.use(express.json());
 // En Railway: Variables → RESEND_API_KEY = re_xxxxxxxxxxxx
 // Obtén tu key gratis en resend.com (no necesitas dominio propio)
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const FROM_EMAIL     = "onboarding@resend.dev"; // funciona sin dominio
+const FROM_EMAIL     = "noreply@sakurachronicles.lat";
 
 function sendEmail(to, subject, html) {
   return new Promise((resolve, reject) => {
