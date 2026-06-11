@@ -22,8 +22,11 @@ const GMAIL_USER = process.env.GMAIL_USER; // tucuenta@gmail.com
 const GMAIL_PASS = process.env.GMAIL_PASS; // contraseña de aplicación (no la normal)
 
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: "smtp.gmail.com",
+  port: 465,
+  secure: true,
   auth: { user: GMAIL_USER, pass: GMAIL_PASS },
+  tls: { rejectUnauthorized: false },
 });
 
 // ── Almacenamiento en memoria (se resetea al reiniciar) ────────
