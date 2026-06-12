@@ -4,17 +4,19 @@
 // Prohibida la copia, distribucion o modificacion no autorizada.
 // Unauthorized copying, distribution or modification is prohibited.
 // ============================================================
-// Auth Backend — Express + Resend API (funciona en Railway)
+// Auth Backend — Express + Resend API + Firestore REST
 // Endpoints:
 //   POST /send-code        → envía código 6 dígitos al email
 //   POST /verify-code      → verifica código, devuelve username e IP
+//   POST /login            → login con email + password
 //   POST /forgot-password  → envía link de reset de contraseña
 //   POST /reset-password   → guarda nueva contraseña con token
+//   POST /save-player      → guarda datos del personaje en Firestore
+//   GET  /load-player      → carga datos del personaje desde Firestore
 // ============================================================
 
 const express = require("express");
 const crypto  = require("crypto");
-const fs      = require("fs");
 const https   = require("https");
 
 const app  = express();
@@ -26,79 +28,19 @@ app.use(express.json());
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const FROM_EMAIL     = "noreply@sakurachronicles.lat";
 
-function sendEmail(to, subject, html) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ from: FROM_EMAIL, to, subject, html });
-    const req = https.request(
-      {
-        hostname: "api.resend.com",
-        path:     "/emails",
-        method:   "POST",
-        headers:  {
-          "Authorization": "Bearer " + RESEND_API_KEY,
-          "Content-Type":  "application/json",
-          "Content-Length": Buffer.byteLength(body),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          if (res.statusCode >= 200 && res.statusCode < 300)
-            resolve(JSON.parse(data));
-          else
-            reject(new Error("Resend " + res.statusCode + ": " + data));
-        });
-      }
-    );
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
-}
+// ── Config Firestore REST ──────────────────────────────────────
+const FIREBASE_API_KEY  = process.env.FIREBASE_API_KEY || "AIzaSyC41SQCDu9r7hGr9ZDYcdA_DybCmMVjYe0";
+const FIRESTORE_PROJECT = "sakura-chronicles";
+const FIRESTORE_BASE    = `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT}/databases/(default)/documents`;
 
-// ── Almacenamiento en memoria ─────────────────────────────────
-const pendingCodes   = new Map(); // email → { code, expires, ip }
-const resetTokens    = new Map(); // token → { email, expires }
-const usedEmails     = new Set();
-const usedIPs        = new Set();
-const passwords      = new Map(); // email → hashedPassword
-const DB_FILE = "./db.json";
+// ── Almacenamiento en memoria (temporal, para códigos y tokens) ─
+const pendingCodes = new Map(); // email → { code, expires, ip }
+const resetTokens  = new Map(); // token → { email, expires }
 
+// ── Utilidades ─────────────────────────────────────────────────
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password + "sakura_salt_2024").digest("hex");
 }
-
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) return;
-  try {
-    const db = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-    (db.gmails    || []).forEach((g) => usedEmails.add(g));
-    (db.ips       || []).forEach((i) => usedIPs.add(i));
-    (db.passwords || []).forEach(([k, v]) => passwords.set(k, v));
-    console.log(`[DB] Cargado: ${usedEmails.size} emails, ${usedIPs.size} IPs`);
-  } catch (e) {
-    console.error("[DB] Error al cargar:", e.message);
-  }
-}
-
-function saveDB() {
-  fs.writeFileSync(
-    DB_FILE,
-    JSON.stringify(
-      {
-        gmails:    [...usedEmails],
-        ips:       [...usedIPs],
-        passwords: [...passwords.entries()],
-        updated:   new Date().toISOString()
-      },
-      null,
-      2
-    )
-  );
-}
-
-loadDB();
 
 function getClientIP(req) {
   return (
@@ -112,31 +54,148 @@ function generateCode() {
   return crypto.randomInt(100000, 999999).toString();
 }
 
+// ── Firestore helpers ──────────────────────────────────────────
+function firestoreRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const url    = `${FIRESTORE_BASE}/${path}?key=${FIREBASE_API_KEY}`;
+    const parsed = new URL(url);
+    const data   = body ? JSON.stringify(body) : null;
+
+    const options = {
+      hostname: parsed.hostname,
+      path:     parsed.pathname + parsed.search,
+      method,
+      headers: { "Content-Type": "application/json" },
+    };
+    if (data) options.headers["Content-Length"] = Buffer.byteLength(data);
+
+    const req = https.request(options, (res) => {
+      let raw = "";
+      res.on("data", (c) => (raw += c));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(raw);
+          if (res.statusCode >= 400) reject(new Error(JSON.stringify(json)));
+          else resolve(json);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on("error", reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+// Convierte objeto JS → formato Firestore
+function toFirestore(obj) {
+  const fields = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === "string")  fields[k] = { stringValue: v };
+    else if (typeof v === "number") fields[k] = { integerValue: v };
+    else if (typeof v === "boolean") fields[k] = { booleanValue: v };
+    else if (v === null) fields[k] = { nullValue: null };
+  }
+  return { fields };
+}
+
+// Convierte respuesta Firestore → objeto JS
+function fromFirestore(doc) {
+  if (!doc || !doc.fields) return null;
+  const obj = {};
+  for (const [k, v] of Object.entries(doc.fields)) {
+    if (v.stringValue  !== undefined) obj[k] = v.stringValue;
+    else if (v.integerValue !== undefined) obj[k] = Number(v.integerValue);
+    else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
+    else if (v.nullValue    !== undefined) obj[k] = null;
+  }
+  return obj;
+}
+
+// Lee un documento de Firestore
+async function fsGet(collection, docId) {
+  try {
+    const doc = await firestoreRequest("GET", `${collection}/${encodeURIComponent(docId)}`);
+    return fromFirestore(doc);
+  } catch (e) {
+    if (e.message.includes("NOT_FOUND") || e.message.includes("404")) return null;
+    throw e;
+  }
+}
+
+// Escribe/sobreescribe un documento de Firestore (PATCH = upsert)
+async function fsSet(collection, docId, data) {
+  const body = toFirestore(data);
+  const fields = Object.keys(data).map(k => `updateMask.fieldPaths=${k}`).join("&");
+  await firestoreRequest(
+    "PATCH",
+    `${collection}/${encodeURIComponent(docId)}?${fields}`,
+    body
+  );
+}
+
+// ── Email ──────────────────────────────────────────────────────
+function sendEmail(to, subject, html) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ from: FROM_EMAIL, to, subject, html });
+    const req = https.request(
+      {
+        hostname: "api.resend.com",
+        path:     "/emails",
+        method:   "POST",
+        headers:  {
+          "Authorization":  "Bearer " + RESEND_API_KEY,
+          "Content-Type":   "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) resolve(JSON.parse(data));
+          else reject(new Error("Resend " + res.statusCode + ": " + data));
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 // ═════════════════════════════════════════════════════════════
 // POST /send-code
 // ═════════════════════════════════════════════════════════════
 app.post("/send-code", async (req, res) => {
   const { gmail } = req.body || {};
-  const ip = getClientIP(req);
+  const ip  = getClientIP(req);
+  const key = (gmail || "").toLowerCase();
 
-  if (!gmail || !gmail.includes("@")) {
+  if (!key || !key.includes("@"))
     return res.status(400).json({ ok: false, error: "Email inválido." });
-  }
-  if (usedEmails.has(gmail.toLowerCase())) {
-    return res.status(400).json({ ok: false, error: "Este email ya tiene una cuenta." });
-  }
-  if (usedIPs.has(ip)) {
-    return res.status(400).json({ ok: false, error: "Ya existe una cuenta desde esta IP." });
+
+  // Verificar si ya existe en Firestore
+  try {
+    const existing = await fsGet("users", key);
+    if (existing) return res.status(400).json({ ok: false, error: "Este email ya tiene una cuenta." });
+
+    // Verificar IP
+    const ipDoc = await fsGet("ips", ip.replace(/[.:]/g, "_"));
+    if (ipDoc) return res.status(400).json({ ok: false, error: "Ya existe una cuenta desde esta IP." });
+  } catch (e) {
+    console.error("[Firestore] Error verificando usuario:", e.message);
+    return res.status(500).json({ ok: false, error: "Error interno." });
   }
 
-  const existing = pendingCodes.get(gmail.toLowerCase());
-  if (existing && Date.now() < existing.expires - 4 * 60 * 1000) {
+  const prev = pendingCodes.get(key);
+  if (prev && Date.now() < prev.expires - 4 * 60 * 1000)
     return res.status(429).json({ ok: false, error: "Espera 60 segundos antes de pedir otro código." });
-  }
 
   const code    = generateCode();
   const expires = Date.now() + 5 * 60 * 1000;
-  pendingCodes.set(gmail.toLowerCase(), { code, expires, ip });
+  pendingCodes.set(key, { code, expires, ip });
 
   try {
     await sendEmail(
@@ -154,7 +213,7 @@ app.post("/send-code", async (req, res) => {
         </p>
       </div>`
     );
-    console.log(`[Auth] Código enviado a ${gmail} desde IP ${ip}`);
+    console.log(`[Auth] Código enviado a ${key} desde IP ${ip}`);
     res.json({ ok: true });
   } catch (err) {
     console.error("[Auth] Error email:", err.message);
@@ -163,9 +222,9 @@ app.post("/send-code", async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════
-// POST /verify-code
+// POST /verify-code   (registro)
 // ═════════════════════════════════════════════════════════════
-app.post("/verify-code", (req, res) => {
+app.post("/verify-code", async (req, res) => {
   const { gmail, code, password } = req.body || {};
   const ip  = getClientIP(req);
   const key = (gmail || "").toLowerCase();
@@ -180,49 +239,77 @@ app.post("/verify-code", (req, res) => {
   if (pending.code !== String(code).trim())
     return res.status(400).json({ ok: false, error: "Código incorrecto." });
 
-  usedEmails.add(key);
-  usedIPs.add(ip);
   pendingCodes.delete(key);
 
-  // Guardar contraseña si se envía
-  if (password) {
-    passwords.set(key, hashPassword(password));
-  }
-
-  saveDB();
-
   const username = key.split("@")[0].replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 20);
-  console.log(`[Auth] ✅ Cuenta verificada: ${key} | IP: ${ip} | username: ${username}`);
-  res.json({ ok: true, username, ip, gmail: key });
+  const ipKey    = ip.replace(/[.:]/g, "_");
+
+  try {
+    // Guardar usuario en Firestore
+    await fsSet("users", key, {
+      email:    key,
+      username,
+      password: password ? hashPassword(password) : "",
+      ip,
+      created:  new Date().toISOString(),
+    });
+    // Guardar IP en Firestore
+    await fsSet("ips", ipKey, { email: key, created: new Date().toISOString() });
+
+    console.log(`[Auth] ✅ Cuenta creada: ${key} | IP: ${ip} | username: ${username}`);
+    res.json({ ok: true, username, ip, gmail: key });
+  } catch (e) {
+    console.error("[Firestore] Error guardando usuario:", e.message);
+    res.status(500).json({ ok: false, error: "Error guardando cuenta." });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════
+// POST /login
+// ═════════════════════════════════════════════════════════════
+app.post("/login", async (req, res) => {
+  const { gmail, password } = req.body || {};
+  const key = (gmail || "").toLowerCase();
+
+  if (!key || !password)
+    return res.status(400).json({ ok: false, error: "Email y contraseña requeridos." });
+
+  try {
+    const user = await fsGet("users", key);
+    if (!user)
+      return res.status(400).json({ ok: false, error: "Email no registrado." });
+    if (user.password !== hashPassword(password))
+      return res.status(400).json({ ok: false, error: "Contraseña incorrecta." });
+
+    console.log(`[Auth] ✅ Login: ${key}`);
+    res.json({ ok: true, username: user.username, gmail: key });
+  } catch (e) {
+    console.error("[Firestore] Error en login:", e.message);
+    res.status(500).json({ ok: false, error: "Error interno." });
+  }
 });
 
 // ═════════════════════════════════════════════════════════════
 // POST /forgot-password
-// Body: { gmail }
-// Envía un link de reset al correo del usuario
 // ═════════════════════════════════════════════════════════════
 app.post("/forgot-password", async (req, res) => {
   const { gmail } = req.body || {};
   const key = (gmail || "").toLowerCase();
 
-  if (!key || !key.includes("@")) {
+  if (!key || !key.includes("@"))
     return res.status(400).json({ ok: false, error: "Email inválido." });
-  }
-
-  // Siempre responder ok para no revelar si el email existe
-  if (!usedEmails.has(key)) {
-    return res.json({ ok: true, message: "Si el email existe, recibirás un enlace." });
-  }
-
-  // Generar token único
-  const token   = crypto.randomBytes(32).toString("hex");
-  const expires = Date.now() + 30 * 60 * 1000; // 30 minutos
-  resetTokens.set(token, { email: key, expires });
-
-  const SERVER_URL = process.env.SERVER_URL || "https://sakurachronicles.up.railway.app";
-  const resetLink  = `${SERVER_URL}/reset-password?token=${token}`;
 
   try {
+    const user = await fsGet("users", key);
+    if (!user) return res.json({ ok: true, message: "Si el email existe, recibirás un enlace." });
+
+    const token   = crypto.randomBytes(32).toString("hex");
+    const expires = Date.now() + 30 * 60 * 1000;
+    resetTokens.set(token, { email: key, expires });
+
+    const SERVER_URL = process.env.SERVER_URL || "https://sakurachronicles.up.railway.app";
+    const resetLink  = `${SERVER_URL}/reset-password?token=${token}`;
+
     await sendEmail(
       key,
       "🌸 Recuperar contraseña — Sakura Chronicles",
@@ -230,8 +317,7 @@ app.post("/forgot-password", async (req, res) => {
         <h2 style="color:#f0c040;text-align:center">✦ SAKURA CHRONICLES ✦</h2>
         <p style="text-align:center;color:#b0a0d0">Recibimos una solicitud para restablecer tu contraseña.</p>
         <div style="text-align:center;margin:24px 0">
-          <a href="${resetLink}"
-             style="background:#6644aa;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px">
+          <a href="${resetLink}" style="background:#6644aa;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px">
             Restablecer contraseña
           </a>
         </div>
@@ -244,45 +330,42 @@ app.post("/forgot-password", async (req, res) => {
     console.log(`[Auth] Reset enviado a ${key}`);
     res.json({ ok: true, message: "Si el email existe, recibirás un enlace." });
   } catch (err) {
-    console.error("[Auth] Error reset email:", err.message);
+    console.error("[Auth] Error reset:", err.message);
     res.status(500).json({ ok: false, error: "No se pudo enviar el email." });
   }
 });
 
 // ═════════════════════════════════════════════════════════════
-// POST /reset-password
-// Body: { token, newPassword }
+// POST /reset-password  (API)
 // ═════════════════════════════════════════════════════════════
-app.post("/reset-password", (req, res) => {
+app.post("/reset-password", async (req, res) => {
   const { token, newPassword } = req.body || {};
 
-  if (!token || !newPassword) {
+  if (!token || !newPassword)
     return res.status(400).json({ ok: false, error: "Token y nueva contraseña requeridos." });
-  }
-  if (newPassword.length < 6) {
+  if (newPassword.length < 6)
     return res.status(400).json({ ok: false, error: "La contraseña debe tener al menos 6 caracteres." });
-  }
 
   const data = resetTokens.get(token);
-  if (!data) {
-    return res.status(400).json({ ok: false, error: "Token inválido o ya usado." });
-  }
+  if (!data) return res.status(400).json({ ok: false, error: "Token inválido o ya usado." });
   if (Date.now() > data.expires) {
     resetTokens.delete(token);
     return res.status(400).json({ ok: false, error: "Token expirado. Solicita uno nuevo." });
   }
 
-  passwords.set(data.email, hashPassword(newPassword));
-  resetTokens.delete(token);
-  saveDB();
-
-  console.log(`[Auth] ✅ Contraseña restablecida para: ${data.email}`);
-  res.json({ ok: true, message: "Contraseña actualizada correctamente." });
+  try {
+    await fsSet("users", data.email, { password: hashPassword(newPassword) });
+    resetTokens.delete(token);
+    console.log(`[Auth] ✅ Contraseña restablecida para: ${data.email}`);
+    res.json({ ok: true, message: "Contraseña actualizada correctamente." });
+  } catch (e) {
+    console.error("[Firestore] Error reset password:", e.message);
+    res.status(500).json({ ok: false, error: "Error guardando contraseña." });
+  }
 });
 
 // ═════════════════════════════════════════════════════════════
-// GET /reset-password?token=xxx
-// Página web simple para ingresar nueva contraseña
+// GET /reset-password?token=xxx  (página web)
 // ═════════════════════════════════════════════════════════════
 app.get("/reset-password", (req, res) => {
   const { token } = req.query;
@@ -317,11 +400,11 @@ app.get("/reset-password", (req, res) => {
       </div>
       <script>
         async function doReset() {
-          const pw = document.getElementById('pw').value;
+          const pw  = document.getElementById('pw').value;
           const pw2 = document.getElementById('pw2').value;
           const msg = document.getElementById('msg');
           if (pw.length < 6) { msg.style.color='#ff6060'; msg.textContent='Mínimo 6 caracteres.'; return; }
-          if (pw !== pw2) { msg.style.color='#ff6060'; msg.textContent='Las contraseñas no coinciden.'; return; }
+          if (pw !== pw2)    { msg.style.color='#ff6060'; msg.textContent='Las contraseñas no coinciden.'; return; }
           msg.style.color='#f0c040'; msg.textContent='Procesando...';
           const r = await fetch('/reset-password', {
             method: 'POST',
@@ -343,9 +426,75 @@ app.get("/reset-password", (req, res) => {
   `);
 });
 
+// ═════════════════════════════════════════════════════════════
+// POST /save-player
+// Body: { gmail, password, coins, xp, level, slot1, slot2, slot3 }
+// ═════════════════════════════════════════════════════════════
+app.post("/save-player", async (req, res) => {
+  const { gmail, password, coins, xp, level, slot1, slot2, slot3 } = req.body || {};
+  const key = (gmail || "").toLowerCase();
+
+  if (!key || !password)
+    return res.status(400).json({ ok: false, error: "Email y contraseña requeridos." });
+
+  try {
+    const user = await fsGet("users", key);
+    if (!user) return res.status(400).json({ ok: false, error: "Usuario no encontrado." });
+    if (user.password !== hashPassword(password))
+      return res.status(401).json({ ok: false, error: "Contraseña incorrecta." });
+
+    await fsSet("players", key, {
+      coins:   coins  ?? 0,
+      xp:      xp     ?? 0,
+      level:   level  ?? 1,
+      slot1:   slot1  ?? "",
+      slot2:   slot2  ?? "",
+      slot3:   slot3  ?? "",
+      updated: new Date().toISOString(),
+    });
+
+    console.log(`[Game] ✅ Guardado: ${key} | coins:${coins} xp:${xp} lv:${level}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[Firestore] Error save-player:", e.message);
+    res.status(500).json({ ok: false, error: "Error guardando datos." });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════
+// POST /load-player
+// Body: { gmail, password }
+// ═════════════════════════════════════════════════════════════
+app.post("/load-player", async (req, res) => {
+  const { gmail, password } = req.body || {};
+  const key = (gmail || "").toLowerCase();
+
+  if (!key || !password)
+    return res.status(400).json({ ok: false, error: "Email y contraseña requeridos." });
+
+  try {
+    const user = await fsGet("users", key);
+    if (!user) return res.status(400).json({ ok: false, error: "Usuario no encontrado." });
+    if (user.password !== hashPassword(password))
+      return res.status(401).json({ ok: false, error: "Contraseña incorrecta." });
+
+    const player = await fsGet("players", key);
+    if (!player) {
+      // Primera vez — devolver datos por defecto
+      return res.json({ ok: true, coins: 0, xp: 0, level: 1, slot1: "", slot2: "", slot3: "" });
+    }
+
+    console.log(`[Game] ✅ Cargado: ${key}`);
+    res.json({ ok: true, ...player });
+  } catch (e) {
+    console.error("[Firestore] Error load-player:", e.message);
+    res.status(500).json({ ok: false, error: "Error cargando datos." });
+  }
+});
+
 // ── Health check ──────────────────────────────────────────────
 app.get("/health", (_, res) =>
-  res.json({ status: "ok", accounts: usedEmails.size, pending: pendingCodes.size })
+  res.json({ status: "ok", pending_codes: pendingCodes.size, reset_tokens: resetTokens.size })
 );
 
 app.listen(PORT, () => {

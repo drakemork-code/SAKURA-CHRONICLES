@@ -1,7 +1,7 @@
 {
   "name": "sakura-auth-backend",
   "version": "1.0.0",
-  "description": "Auth backend para Sakura Chronicles — Gmail verification + IP control",
+  "description": "Auth backend para Sakura Chronicles — Gmail verification + IP control + Firestore",
   "main": "auth_server.js",
   "scripts": {
     "start": "node auth_server.js",
