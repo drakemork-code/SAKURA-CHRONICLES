@@ -57,7 +57,8 @@ function generateCode() {
 // ── Firestore helpers ──────────────────────────────────────────
 function firestoreRequest(method, path, body) {
   return new Promise((resolve, reject) => {
-    const url    = `${FIRESTORE_BASE}/${path}?key=${FIREBASE_API_KEY}`;
+    const sep    = path.includes("?") ? "&" : "?";
+    const url    = `${FIRESTORE_BASE}/${path}${sep}key=${FIREBASE_API_KEY}`;
     const parsed = new URL(url);
     const data   = body ? JSON.stringify(body) : null;
 
