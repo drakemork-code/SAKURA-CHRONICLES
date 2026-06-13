@@ -11,8 +11,8 @@
 //   POST /login            → login con email + password
 //   POST /forgot-password  → envía link de reset de contraseña
 //   POST /reset-password   → guarda nueva contraseña con token
-//   POST /save-player      → guarda datos del personaje en Firestore
-//   GET  /load-player      → carga datos del personaje desde Firestore
+//   POST /save-player      → guarda TODOS los datos del personaje (WoW-style)
+//   POST /load-player      → carga TODOS los datos del personaje
 // ============================================================
 
 const express = require("express");
@@ -22,7 +22,7 @@ const https   = require("https");
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 // ── Config Resend ─────────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -89,27 +89,60 @@ function firestoreRequest(method, path, body) {
   });
 }
 
-// Convierte objeto JS → formato Firestore
+// ── Firestore value converters ─────────────────────────────────
+
+function toFirestoreValue(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === "string")  return { stringValue: v };
+  if (typeof v === "boolean") return { booleanValue: v };
+  if (typeof v === "number") {
+    return Number.isInteger(v)
+      ? { integerValue: String(v) }
+      : { doubleValue: v };
+  }
+  if (Array.isArray(v)) {
+    return { arrayValue: { values: v.map(toFirestoreValue) } };
+  }
+  if (typeof v === "object") {
+    const fields = {};
+    for (const [k, val] of Object.entries(v)) {
+      fields[k] = toFirestoreValue(val);
+    }
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(v) };
+}
+
 function toFirestore(obj) {
   const fields = {};
   for (const [k, v] of Object.entries(obj)) {
-    if (typeof v === "string")  fields[k] = { stringValue: v };
-    else if (typeof v === "number") fields[k] = { integerValue: v };
-    else if (typeof v === "boolean") fields[k] = { booleanValue: v };
-    else if (v === null) fields[k] = { nullValue: null };
+    fields[k] = toFirestoreValue(v);
   }
   return { fields };
 }
 
-// Convierte respuesta Firestore → objeto JS
+function fromFirestoreValue(v) {
+  if (!v) return null;
+  if ("stringValue"  in v) return v.stringValue;
+  if ("booleanValue" in v) return v.booleanValue;
+  if ("integerValue" in v) return Number(v.integerValue);
+  if ("doubleValue"  in v) return v.doubleValue;
+  if ("nullValue"    in v) return null;
+  if ("arrayValue"   in v) {
+    const vals = v.arrayValue?.values || [];
+    return vals.map(fromFirestoreValue);
+  }
+  if ("mapValue" in v) {
+    return fromFirestore(v.mapValue);
+  }
+  return null;
+}
+
 function fromFirestore(doc) {
   if (!doc || !doc.fields) return null;
   const obj = {};
   for (const [k, v] of Object.entries(doc.fields)) {
-    if (v.stringValue  !== undefined) obj[k] = v.stringValue;
-    else if (v.integerValue !== undefined) obj[k] = Number(v.integerValue);
-    else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
-    else if (v.nullValue    !== undefined) obj[k] = null;
+    obj[k] = fromFirestoreValue(v);
   }
   return obj;
 }
@@ -128,7 +161,7 @@ async function fsGet(collection, docId) {
 // Escribe/sobreescribe un documento de Firestore (PATCH = upsert)
 async function fsSet(collection, docId, data) {
   const body = toFirestore(data);
-  const fields = Object.keys(data).map(k => `updateMask.fieldPaths=${k}`).join("&");
+  const fields = Object.keys(data).map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
   await firestoreRequest(
     "PATCH",
     `${collection}/${encodeURIComponent(docId)}?${fields}`,
@@ -246,7 +279,6 @@ app.post("/verify-code", async (req, res) => {
   const ipKey    = ip.replace(/[.:]/g, "_");
 
   try {
-    // Guardar usuario en Firestore
     await fsSet("users", key, {
       email:    key,
       username,
@@ -254,7 +286,6 @@ app.post("/verify-code", async (req, res) => {
       ip,
       created:  new Date().toISOString(),
     });
-    // Guardar IP en Firestore
     await fsSet("ips", ipKey, { email: key, created: new Date().toISOString() });
 
     console.log(`[Auth] ✅ Cuenta creada: ${key} | IP: ${ip} | username: ${username}`);
@@ -428,11 +459,38 @@ app.get("/reset-password", (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════
-// POST /save-player
-// Body: { gmail, password, coins, xp, level, slot1, slot2, slot3 }
+// POST /save-player  — FULL SERVER-SIDE PERSISTENCE (WoW-style)
+//
+// Body esperado:
+// {
+//   gmail, password,
+//   character_slot: 0|1|2,   ← índice del slot activo
+//   character: {              ← datos de PlayerData
+//     name, gender, race, hair_style,
+//     skin_r, skin_g, skin_b,
+//     hair_r, hair_g, hair_b,
+//     eye_r,  eye_g,  eye_b,
+//     outfit_r, outfit_g, outfit_b,
+//     level, xp, max_hp, hp, max_energy, energy,
+//     speed, base_attack, tutorial_done,
+//     bronze, silver, gold,
+//     gathering_skills: { mining:{level,xp}, woodcutting:{level,xp}, herbalism:{level,xp} },
+//     crafting_skills:  { smithing:{level,xp}, tailoring:{level,xp}, alchemy:{level,xp} },
+//   },
+//   inventory: [              ← array de 40 slots (null o {key,qty,quality,durability})
+//     null, { key:"iron_sword", qty:1, quality:"normal", durability:100 }, ...
+//   ],
+//   equipped: {               ← dict por slot
+//     head: null, chest: {key,qty,quality,durability}, ...
+//   },
+//   bank: {
+//     tier: 0,
+//     items: [ null, {key,qty,quality,durability}, ... ]
+//   }
+// }
 // ═════════════════════════════════════════════════════════════
 app.post("/save-player", async (req, res) => {
-  const { gmail, password, coins, xp, level, slot1, slot2, slot3 } = req.body || {};
+  const { gmail, password, character_slot, character, inventory, equipped, bank } = req.body || {};
   const key = (gmail || "").toLowerCase();
 
   if (!key || !password)
@@ -444,17 +502,36 @@ app.post("/save-player", async (req, res) => {
     if (user.password !== hashPassword(password))
       return res.status(401).json({ ok: false, error: "Contraseña incorrecta." });
 
-    await fsSet("players", key, {
-      coins:   coins  ?? 0,
-      xp:      xp     ?? 0,
-      level:   level  ?? 1,
-      slot1:   slot1  ?? "",
-      slot2:   slot2  ?? "",
-      slot3:   slot3  ?? "",
-      updated: new Date().toISOString(),
-    });
+    const slot = typeof character_slot === "number" ? character_slot : 0;
 
-    console.log(`[Game] ✅ Guardado: ${key} | coins:${coins} xp:${xp} lv:${level}`);
+    // Estructura del documento del jugador en Firestore
+    // Usamos un solo doc "players/<email>" con campos anidados por slot
+    const playerData = {
+      updated: new Date().toISOString(),
+      active_slot: slot,
+      // Guardamos los tres slots por si existen — solo tocamos el slot activo
+    };
+
+    // Serializar datos del personaje (character)
+    if (character) {
+      playerData[`slot${slot}_character`] = JSON.stringify(character);
+    }
+    // Serializar inventario completo
+    if (inventory !== undefined) {
+      playerData[`slot${slot}_inventory`] = JSON.stringify(inventory);
+    }
+    // Serializar equipo equipado
+    if (equipped !== undefined) {
+      playerData[`slot${slot}_equipped`] = JSON.stringify(equipped);
+    }
+    // Serializar banco
+    if (bank !== undefined) {
+      playerData[`slot${slot}_bank`] = JSON.stringify(bank);
+    }
+
+    await fsSet("players", key, playerData);
+
+    console.log(`[Game] ✅ Save completo: ${key} | slot:${slot} | lv:${character?.level ?? "?"} | bronze:${character?.bronze ?? "?"} | items:${Array.isArray(inventory) ? inventory.filter(Boolean).length : "?"}`);
     res.json({ ok: true });
   } catch (e) {
     console.error("[Firestore] Error save-player:", e.message);
@@ -463,8 +540,24 @@ app.post("/save-player", async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════
-// POST /load-player
+// POST /load-player  — FULL SERVER-SIDE PERSISTENCE (WoW-style)
+//
 // Body: { gmail, password }
+// Devuelve:
+// {
+//   ok: true,
+//   active_slot: 0,
+//   slots: [
+//     {                        ← slot 0
+//       character: {...},
+//       inventory: [...],
+//       equipped: {...},
+//       bank: { tier, items:[...] }
+//     },
+//     null,                    ← slot 1 vacío
+//     null,                    ← slot 2 vacío
+//   ]
+// }
 // ═════════════════════════════════════════════════════════════
 app.post("/load-player", async (req, res) => {
   const { gmail, password } = req.body || {};
@@ -480,13 +573,40 @@ app.post("/load-player", async (req, res) => {
       return res.status(401).json({ ok: false, error: "Contraseña incorrecta." });
 
     const player = await fsGet("players", key);
+
     if (!player) {
-      // Primera vez — devolver datos por defecto
-      return res.json({ ok: true, coins: 0, xp: 0, level: 1, slot1: "", slot2: "", slot3: "" });
+      // Primera vez — slots vacíos
+      return res.json({
+        ok: true,
+        active_slot: 0,
+        slots: [null, null, null],
+      });
     }
 
-    console.log(`[Game] ✅ Cargado: ${key}`);
-    res.json({ ok: true, ...player });
+    // Reconstruir los 3 slots
+    const slots = [0, 1, 2].map(slot => {
+      const charStr = player[`slot${slot}_character`];
+      if (!charStr) return null;
+
+      let character = null, inventory = null, equipped = null, bank = null;
+      try { character = JSON.parse(charStr); } catch (_) { character = null; }
+
+      const invStr = player[`slot${slot}_inventory`];
+      if (invStr) try { inventory = JSON.parse(invStr); } catch (_) { inventory = []; }
+
+      const eqStr = player[`slot${slot}_equipped`];
+      if (eqStr) try { equipped = JSON.parse(eqStr); } catch (_) { equipped = {}; }
+
+      const bankStr = player[`slot${slot}_bank`];
+      if (bankStr) try { bank = JSON.parse(bankStr); } catch (_) { bank = { tier: 0, items: [] }; }
+
+      return { character, inventory, equipped, bank };
+    });
+
+    const active_slot = typeof player.active_slot === "number" ? player.active_slot : 0;
+
+    console.log(`[Game] ✅ Load completo: ${key} | active_slot:${active_slot}`);
+    res.json({ ok: true, active_slot, slots });
   } catch (e) {
     console.error("[Firestore] Error load-player:", e.message);
     res.status(500).json({ ok: false, error: "Error cargando datos." });
