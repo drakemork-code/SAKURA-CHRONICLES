@@ -6,6 +6,7 @@
 // ============================================================
 // Auth Backend — Express + Resend API + Firestore REST
 // Endpoints:
+//   GET  /version-check     → consulta de versión mínima / mantenimiento
 //   POST /send-code        → envía código 6 dígitos al email
 //   POST /verify-code      → verifica código, devuelve username e IP
 //   POST /login            → login con email + password
@@ -18,6 +19,8 @@
 const express = require("express");
 const crypto  = require("crypto");
 const https   = require("https");
+const fs      = require("fs");
+const path    = require("path");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -167,6 +170,101 @@ async function fsSet(collection, docId, data) {
     `${collection}/${encodeURIComponent(docId)}?${fields}`,
     body
   );
+}
+
+// ═════════════════════════════════════════════════════════════
+// SISTEMA DE VERSIONES — control de versión mínima del cliente
+//
+// Fuente de verdad: documento Firestore "config/versions".
+// Así, para bloquear una versión vieja, solo se edita ese
+// documento (a mano en la consola de Firestore, o llamando
+// POST /admin/versions con el ADMIN_TOKEN) — sin tocar código
+// ni redeployar nada.
+//
+// Fallback: si Firestore falla (o al arrancar, antes de la
+// primera lectura), se usa versions.json como semilla local.
+// Cache en memoria de VERSION_CACHE_MS para no golpear Firestore
+// en cada polling de cliente/servidor de combate.
+// ═════════════════════════════════════════════════════════════
+const VERSIONS_FILE     = path.join(__dirname, "versions.json");
+const VERSION_CACHE_MS  = 30 * 1000;
+const ADMIN_TOKEN       = process.env.ADMIN_TOKEN || "";
+
+let _versionCache      = null; // { latest_version, minimum_version, download_url, maintenance, maintenance_message }
+let _versionCacheAt    = 0;
+
+function loadLocalVersionsFile() {
+  try {
+    const raw = fs.readFileSync(VERSIONS_FILE, "utf8");
+    return JSON.parse(raw);
+  } catch (e) {
+    // Semilla mínima de emergencia si ni siquiera existe el archivo local
+    return {
+      latest_version:      "1.0.0",
+      minimum_version:     "1.0.0",
+      download_url:        "https://sakurachronicles.lat",
+      maintenance:         false,
+      maintenance_message: "",
+    };
+  }
+}
+
+function normalizeVersionDoc(doc) {
+  const fallback = loadLocalVersionsFile();
+  return {
+    latest_version:      doc.latest_version      ?? fallback.latest_version,
+    minimum_version:     doc.minimum_version     ?? fallback.minimum_version,
+    download_url:        doc.download_url        ?? fallback.download_url,
+    maintenance:         doc.maintenance         ?? false,
+    maintenance_message: doc.maintenance_message ?? "",
+  };
+}
+
+// Compara versiones semver-like "1.2.10" > "1.2.9" (numérico por segmento,
+// no lexicográfico — así "1.2.10" no queda por debajo de "1.2.9").
+function compareVersions(a, b) {
+  const pa = String(a).split(".").map(n => parseInt(n, 10) || 0);
+  const pb = String(b).split(".").map(n => parseInt(n, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const da = pa[i] || 0, db = pb[i] || 0;
+    if (da !== db) return da > db ? 1 : -1;
+  }
+  return 0;
+}
+
+// Lee la config de versiones (Firestore, con cache + fallback local)
+async function getVersionConfig(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && _versionCache && (now - _versionCacheAt) < VERSION_CACHE_MS) {
+    return _versionCache;
+  }
+  try {
+    const doc = await fsGet("config", "versions");
+    if (doc) {
+      _versionCache   = normalizeVersionDoc(doc);
+      _versionCacheAt = now;
+      return _versionCache;
+    }
+  } catch (e) {
+    console.error("[Version] Error leyendo config/versions de Firestore:", e.message);
+  }
+  // Firestore no tiene el doc todavía, o falló: usar fallback local.
+  // No se actualiza _versionCacheAt a "now" completo para reintentar pronto.
+  if (_versionCache) return _versionCache; // último valor bueno conocido
+  _versionCache   = normalizeVersionDoc(loadLocalVersionsFile());
+  _versionCacheAt = now;
+  return _versionCache;
+}
+
+// Escribe la config de versiones en Firestore y refresca la cache local
+async function setVersionConfig(partial) {
+  const current = await getVersionConfig(true);
+  const merged  = normalizeVersionDoc({ ...current, ...partial });
+  await fsSet("config", "versions", merged);
+  _versionCache   = merged;
+  _versionCacheAt = Date.now();
+  return merged;
 }
 
 // ── Email ──────────────────────────────────────────────────────
@@ -613,12 +711,132 @@ app.post("/load-player", async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════
+// GET/POST /version-check
+//
+// El cliente (y el servidor de combate) consultan este endpoint
+// para saber si la versión que tienen puede seguir jugando.
+//
+// Body/Query esperado: { client_version: "1.0.14" }
+// (GET usa query string ?client_version=1.0.14 — útil para
+//  llamadas simples desde curl/health checks; POST usa JSON body,
+//  que es lo que usa el cliente Godot)
+//
+// Respuesta:
+// {
+//   ok: true,
+//   status: "OK" | "UPDATE_REQUIRED" | "MAINTENANCE",
+//   client_version:  "1.0.14",
+//   latest_version:  "1.0.15",
+//   minimum_version: "1.0.15",
+//   download_url:    "https://sakurachronicles.lat",
+//   maintenance_message: ""
+// }
+// ═════════════════════════════════════════════════════════════
+async function handleVersionCheck(req, res) {
+  const clientVersion = String(
+    (req.method === "GET" ? req.query.client_version : req.body?.client_version) || "0.0.0"
+  ).trim();
+
+  try {
+    const cfg = await getVersionConfig();
+
+    let status = "OK";
+    if (cfg.maintenance) {
+      status = "MAINTENANCE";
+    } else if (compareVersions(clientVersion, cfg.minimum_version) < 0) {
+      status = "UPDATE_REQUIRED";
+    }
+
+    res.json({
+      ok: true,
+      status,
+      client_version:      clientVersion,
+      latest_version:      cfg.latest_version,
+      minimum_version:     cfg.minimum_version,
+      download_url:        cfg.download_url,
+      maintenance:          !!cfg.maintenance,
+      maintenance_message: cfg.maintenance_message || "",
+    });
+  } catch (e) {
+    console.error("[Version] Error en version-check:", e.message);
+    // Fail-open en caso de error interno inesperado: no queremos tumbar
+    // el juego entero por un bug en el propio chequeo de versión.
+    res.json({
+      ok: true,
+      status: "OK",
+      client_version: clientVersion,
+      latest_version: clientVersion,
+      minimum_version: "0.0.0",
+      download_url: "https://sakurachronicles.lat",
+      maintenance: false,
+      maintenance_message: "",
+    });
+  }
+}
+
+app.get("/version-check", handleVersionCheck);
+app.post("/version-check", handleVersionCheck);
+
+// ═════════════════════════════════════════════════════════════
+// POST /admin/versions  — actualizar versión mínima / mantenimiento
+//
+// Protegido con header "x-admin-token" que debe coincidir con la
+// env var ADMIN_TOKEN configurada en Railway. Si ADMIN_TOKEN no
+// está configurado, este endpoint se deshabilita por completo
+// (fail-closed) para no dejarlo abierto por accidente.
+//
+// Body: cualquier subconjunto de
+// { latest_version, minimum_version, download_url, maintenance, maintenance_message }
+//
+// Ejemplo para forzar actualización obligatoria a 1.0.16:
+//   curl -X POST https://.../admin/versions \
+//     -H "x-admin-token: TU_TOKEN" -H "Content-Type: application/json" \
+//     -d '{"latest_version":"1.0.16","minimum_version":"1.0.16"}'
+// ═════════════════════════════════════════════════════════════
+app.post("/admin/versions", async (req, res) => {
+  if (!ADMIN_TOKEN) {
+    return res.status(503).json({ ok: false, error: "Admin endpoint deshabilitado (ADMIN_TOKEN no configurado)." });
+  }
+  const token = req.headers["x-admin-token"];
+  if (token !== ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Token inválido." });
+  }
+  try {
+    const merged = await setVersionConfig(req.body || {});
+    console.log("[Version] Config actualizada por admin:", JSON.stringify(merged));
+    res.json({ ok: true, config: merged });
+  } catch (e) {
+    console.error("[Version] Error guardando config:", e.message);
+    res.status(500).json({ ok: false, error: "Error guardando configuración de versiones." });
+  }
+});
+
+app.get("/admin/versions", async (req, res) => {
+  if (!ADMIN_TOKEN) {
+    return res.status(503).json({ ok: false, error: "Admin endpoint deshabilitado (ADMIN_TOKEN no configurado)." });
+  }
+  const token = req.headers["x-admin-token"];
+  if (token !== ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Token inválido." });
+  }
+  const cfg = await getVersionConfig(true);
+  res.json({ ok: true, config: cfg });
+});
+
 // ── Health check ──────────────────────────────────────────────
 app.get("/health", (_, res) =>
   res.json({ status: "ok", pending_codes: pendingCodes.size, reset_tokens: resetTokens.size })
 );
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[Auth Server] Escuchando en puerto ${PORT}`);
   if (!RESEND_API_KEY) console.warn("[Auth] ⚠ RESEND_API_KEY no configurado");
+  if (!ADMIN_TOKEN) console.warn("[Auth] ⚠ ADMIN_TOKEN no configurado — /admin/versions deshabilitado");
+  try {
+    const cfg = await getVersionConfig(true);
+    console.log(`[Version] Config activa: latest=${cfg.latest_version} minimum=${cfg.minimum_version} maintenance=${cfg.maintenance}`);
+  } catch (e) {
+    console.warn("[Version] No se pudo precargar config de versiones:", e.message);
+  }
 });
