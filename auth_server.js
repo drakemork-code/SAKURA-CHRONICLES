@@ -200,8 +200,8 @@ function loadLocalVersionsFile() {
   } catch (e) {
     // Semilla mínima de emergencia si ni siquiera existe el archivo local
     return {
-      latest_version:      "1.0.0",
-      minimum_version:     "1.0.0",
+      latest_version:      "2.0.1",
+      minimum_version:     "2.0.1",
       download_url:        "https://sakurachronicles.lat",
       maintenance:         false,
       maintenance_message: "",
